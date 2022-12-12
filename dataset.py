@@ -59,8 +59,8 @@ class QualityMapDataset(Dataset):
         return grid
 
     def __getitem__(self, idx):
-        img = Image.open(self.paths[idx]).convert('RGB')
-        segmap = Image.open(self.map_paths[idx]) if self.map_paths else Image.fromarray(
+        img = Image.open(self.paths[idx][3:]).convert('RGB')
+        segmap = Image.open(self.map_paths[idx][3:]) if self.map_paths else Image.fromarray(
             np.zeros(img.size[::-1], dtype=np.uint8))
 
         # crop if training

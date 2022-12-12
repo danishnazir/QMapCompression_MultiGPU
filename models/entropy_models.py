@@ -7,7 +7,7 @@ import scipy.stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import compressai as ca
 from torch import Tensor
 
 from compressai._CXX import pmf_to_quantized_cdf as _pmf_to_quantized_cdf

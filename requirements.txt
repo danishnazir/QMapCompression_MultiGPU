@@ -17,7 +17,7 @@ cffi==1.14.4
 chardet==4.0.0
 click==7.1.2
 colorama==0.4.3
--e git+https://github.com/InterDigitalInc/CompressAI@45a0cd37db6589e1323d409226688038a3b33d7b#egg=compressai
+#-e git+https://github.com/InterDigitalInc/CompressAI@45a0cd37db6589e1323d409226688038a3b33d7b#egg=compressai
 coverage==5.3.1
 cycler==0.10.0
 Cython==0.29.21
