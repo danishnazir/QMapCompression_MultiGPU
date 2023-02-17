@@ -13,6 +13,55 @@ from dataset import get_dataloader
 from utils import init, Logger, load_checkpoint, save_checkpoint, AverageMeter
 from losses.losses import Metrics, PixelwiseRateDistortionLoss
 
+class CustomDataParallel(torch.nn.DataParallel):
+    """Custom DataParallel to access the module methods."""
+
+    def __getattr__(self, key):
+        try:
+            return super().__getattr__(key)
+        except AttributeError:
+            return getattr(self.module, key)
+
+def configure_optimizers(net, config):
+    """Separate parameters for the main optimizer and the auxiliary optimizer.
+    Return two optimizers"""
+
+    for name, param in net.named_parameters():
+
+        if (not name.endswith(".quantiles")):
+            print("main model params",name)
+        elif (name.endswith(".quantiles")):
+            print("aux params", name)
+
+    parameters = {
+        n
+        for n, p in net.named_parameters()
+        if not n.endswith(".quantiles") and p.requires_grad
+    }
+    
+    aux_parameters = {
+        n
+        for n, p in net.named_parameters()
+        if n.endswith(".quantiles") and p.requires_grad
+    }
+
+    # Make sure we don't have an intersection of parameters
+    params_dict = dict(net.named_parameters())
+    inter_params = parameters & aux_parameters
+    union_params = parameters | aux_parameters
+
+    assert len(inter_params) == 0
+    assert len(union_params) - len(params_dict.keys()) == 0
+
+    optimizer = optim.Adam(
+        (params_dict[n] for n in sorted(parameters)),
+         lr=config['lr'],
+    )
+    aux_optimizer = optim.Adam(
+        (params_dict[n] for n in sorted(aux_parameters)),
+        lr=config['lr_aux'],
+    )
+    return optimizer, aux_optimizer
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='Spatially-Adaptive Variable Rate Compression')
@@ -44,7 +93,7 @@ def test(logger, test_dataloaders, model, criterion, metric):
     loss = AverageMeter()
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
-
+    device = next(model.parameters()).device
     with torch.no_grad():
         for i, test_dataloader in enumerate(test_dataloaders):
             logger.init()
@@ -80,16 +129,17 @@ def train(args, config, base_dir, snapshot_dir, output_dir, log_dir):
     metric = Metrics()
     train_dataloader, test_dataloaders = get_dataloader(config)
     logger = Logger(config, base_dir, snapshot_dir, output_dir, log_dir)
-
     model = SpatiallyAdaptiveCompression(N=config['N'], M=config['M'], sft_ks=config['sft_ks'], prior_nc=64)
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
-    aux_optimizer = optim.Adam(model.aux_parameters(), lr=config['lr_aux'])
 
+    optimizer,aux_optimizer = configure_optimizers(model,config)
     if args.resume:
         itr, model = load_checkpoint(args.resume, model, optimizer, aux_optimizer)
         logger.load_itr(itr)
-
+        
+        
+    if torch.cuda.device_count() > 1:
+        model = CustomDataParallel(model)
     if config['set_lr']:
         lr_prior = optimizer.param_groups[0]['lr']
         for g in optimizer.param_groups:
@@ -97,14 +147,16 @@ def train(args, config, base_dir, snapshot_dir, output_dir, log_dir):
         print(f'[set lr] {lr_prior} -> {optimizer.param_groups[0]["lr"]}')
 
     model.train()
+    device = next(model.parameters()).device
     loss_best = 1e10
     while logger.itr < config['max_itr']:
         for x, qmap in train_dataloader:
+            
+            x = x.to(device)
+            qmap = qmap.to(device)   
             optimizer.zero_grad()
             aux_optimizer.zero_grad()
 
-            x = x.to(device)
-            qmap = qmap.to(device)
             lmbdamap = quality2lambda(qmap)
 
             out_net = model(x, qmap)

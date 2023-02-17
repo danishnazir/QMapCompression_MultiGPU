@@ -1,4 +1,7 @@
+results/
+.ipynb_checkpoints/
 compressai
 __pycache__
 .idea
 *.pt
+data

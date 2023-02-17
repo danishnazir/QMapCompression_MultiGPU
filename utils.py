@@ -143,13 +143,26 @@ def save_checkpoint(filename, itr, model, optimizer, aux_optimizer, scaler=None)
     if scaler is not None:
         snapshot['scaler'] = scaler.state_dict()
     torch.save(snapshot, filename)
+    
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text  # or whatever
 
 
 def load_checkpoint(path, model, optimizer=None, aux_optimizer=None, scaler=None, only_net=False):
     snapshot = torch.load(path)
     itr = snapshot['itr']
+    dict_ = {}
     print(f'Loaded from {itr} iterations')
+    
+    for k, v in snapshot["model"].items():
+ 
+        k = remove_prefix(k,"module.")
+        dict_[k] = v
+    snapshot["model"] = dict_
     model.load_state_dict(snapshot['model'])
+
     if not only_net:
         if 'optimizer' in snapshot:
             optimizer.load_state_dict(snapshot['optimizer'])

@@ -173,15 +173,16 @@ class ImagenetDataset(Dataset):
 
 
 def get_dataloader(config, L=10):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     train_dataset = QualityMapDataset(config['trainset'], config['patchsize'], mode='train', p=config['p'])
     train_dataloader = DataLoader(train_dataset, batch_size=config['batchsize'], shuffle=True,
-                                  num_workers=config['worker_num'], pin_memory=True)
+                                  num_workers=config['worker_num'], pin_memory= (device == "cuda"))
     levels = [-100] + [int(100*(i/L)) for i in range(L+1)]
     test_dataloaders = []
     for level in levels:
         test_dataset = QualityMapDataset(config['testset'], config['patchsize'], mode='test', p=config['p'], level=level)
         test_dataloader = DataLoader(test_dataset, batch_size=config['batchsize_test'], shuffle=False,
-                                     num_workers=config['worker_num'], pin_memory=True)
+                                     num_workers=config['worker_num'], pin_memory= (device == "cuda"))
         test_dataloaders.append(test_dataloader)
 
     return train_dataloader, test_dataloaders

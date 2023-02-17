@@ -10,7 +10,8 @@ from .entropy_models import EntropyBottleneck, GaussianConditional
 from .layers import GDN
 
 from .utils import conv, deconv, update_registered_buffers
-
+from torch import Tensor
+from typing import cast
 
 SCALES_MIN = 0.11
 SCALES_MAX = 256
@@ -22,79 +23,82 @@ def get_scale_table(
 
 
 class CompressionModel(nn.Module):
-    """Base class for constructing an auto-encoder with at least one entropy
-    bottleneck module.
-
-    Args:
-        entropy_bottleneck_channels (int): Number of channels of the entropy
-            bottleneck
+    """Base class for constructing an auto-encoder with any number of
+    EntropyBottleneck or GaussianConditional modules.
     """
 
-    def __init__(self, entropy_bottleneck_channels, init_weights=True):
-        super().__init__()
-        self.entropy_bottleneck = EntropyBottleneck(entropy_bottleneck_channels)
-
-        if init_weights:
-            self._initialize_weights()
-
-    def aux_loss(self):
-        """Return the aggregated loss over the auxiliary entropy bottleneck
-        module(s).
-        """
-        aux_loss = sum(
-            m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
-        )
-        return aux_loss
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, *args):
-        raise NotImplementedError()
-
-    def parameters(self):
-        """Returns an iterator over the model parameters."""
-        for m in self.children():
-            if isinstance(m, EntropyBottleneck):
+    def load_state_dict(self, state_dict, strict=True):
+  
+        for name, module in self.named_modules():
+            if not any(x.startswith(name) for x in state_dict.keys()):
                 continue
-            for p in m.parameters():
-                yield p
 
-    def aux_parameters(self):
-        """
-        Returns an iterator over the entropy bottleneck(s) parameters for
-        the auxiliary loss.
-        """
-        for m in self.children():
-            if not isinstance(m, EntropyBottleneck):
-                continue
-            for p in m.parameters():
-                yield p
+            if isinstance(module, EntropyBottleneck):
+                update_registered_buffers(
+                    module,
+                    name,
+                    ["_quantized_cdf", "_offset", "_cdf_length"],
+                    state_dict,
+                )
 
-    def update(self, force=False):
-        """Updates the entropy bottleneck(s) CDF values.
+            if isinstance(module, GaussianConditional):
+                update_registered_buffers(
+                    module,
+                    name,
+                    ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+                    state_dict,
+                )
 
+        return nn.Module.load_state_dict(self, state_dict, strict=strict)
+
+    def update(self, scale_table=None, force=False):
+        """Updates EntropyBottleneck and GaussianConditional CDFs.
         Needs to be called once after training to be able to later perform the
         evaluation with an actual entropy coder.
-
         Args:
+            scale_table (torch.Tensor): table of scales (i.e. stdev)
+                for initializing the Gaussian distributions
+                (default: 64 logarithmically spaced scales from 0.11 to 256)
             force (bool): overwrite previous values (default: False)
-
         Returns:
-            updated (bool): True if one of the EntropyBottlenecks was updated.
-
+            updated (bool): True if at least one of the modules was updated.
         """
+        if scale_table is None:
+            scale_table = get_scale_table()
         updated = False
-        for m in self.children():
-            if not isinstance(m, EntropyBottleneck):
-                continue
-            rv = m.update(force=force)
-            updated |= rv
+        for _, module in self.named_modules():
+            if isinstance(module, EntropyBottleneck):
+                updated |= module.update(force=force)
+            if isinstance(module, GaussianConditional):
+                updated |= module.update_scale_table(scale_table, force=force)
         return updated
+
+    def aux_loss(self) -> Tensor:
+        """Returns the total auxiliary loss over all `EntropyBottleneck`s.
+        In contrast to the primary "net" loss used by the "net"
+        optimizer, the "aux" loss is only used by the "aux" optimizer to
+        update *only* the `EntropyBottleneck.quantiles` parameters. In
+        fact, the "aux" loss does not depend on image data at all.
+        The purpose of the "aux" loss is to determine the range within
+        which most of the mass of a given distribution is contained, as
+        well as its median (i.e. 50% probability). That is, for a given
+        distribution, the "aux" loss converges towards satisfying the
+        following conditions for some chosen `tail_mass` probability:
+        - `cdf(quantiles[0]) = tail_mass / 2`,
+        - `cdf(quantiles[1]) = 0.5`, and
+        - `cdf(quantiles[2]) = 1 - tail_mass / 2`.
+        This ensures that the concrete `_quantized_cdf`s operate
+        primarily within a finitely supported region. Any symbols
+        outside this range must be coded using some alternative method
+        that does *not* involve the `_quantized_cdf`s. Luckily, one may
+        choose a `tail_mass` probability that is sufficiently small so
+        that this rarely occurs. It is important that we work with
+        `_quantized_cdf`s that have a small finite support; otherwise,
+        entropy coding runtime performance would suffer. Thus,
+        `tail_mass` should not be too small, either!
+        """
+        loss = sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
+        return cast(Tensor, loss)
 
 
 class ScaleHyperprior(CompressionModel):
@@ -102,7 +106,6 @@ class ScaleHyperprior(CompressionModel):
     N. Johnston: `"Variational Image Compression with a Scale Hyperprior"
     <https://arxiv.org/abs/1802.01436>`_ Int. Conf. on Learning Representations
     (ICLR), 2018.
-
     Args:
         N (int): Number of channels
         M (int): Number of channels in the expansion layers (last layer of the
@@ -110,7 +113,9 @@ class ScaleHyperprior(CompressionModel):
     """
 
     def __init__(self, N, M, **kwargs):
-        super().__init__(entropy_bottleneck_channels=N, **kwargs)
+        super().__init__(**kwargs)
+
+        self.entropy_bottleneck = EntropyBottleneck(N)
 
         self.g_a = nn.Sequential(
             conv(3, N),
@@ -170,22 +175,6 @@ class ScaleHyperprior(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
 
-    def load_state_dict(self, state_dict, strict=True):
-        # Dynamically update the entropy bottleneck buffers related to the CDFs
-        update_registered_buffers(
-            self.entropy_bottleneck,
-            "entropy_bottleneck",
-            ["_quantized_cdf", "_offset", "_cdf_length"],
-            state_dict,
-        )
-        update_registered_buffers(
-            self.gaussian_conditional,
-            "gaussian_conditional",
-            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
-            state_dict,
-        )
-        super().load_state_dict(state_dict, strict=strict)
-
     @classmethod
     def from_state_dict(cls, state_dict):
         """Return a new model instance from `state_dict`."""
@@ -194,13 +183,6 @@ class ScaleHyperprior(CompressionModel):
         net = cls(N, M)
         net.load_state_dict(state_dict)
         return net
-
-    def update(self, scale_table=None, force=False):
-        if scale_table is None:
-            scale_table = get_scale_table()
-        updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
-        updated |= super().update(force=force)
-        return updated
 
     def compress(self, x):
         y = self.g_a(x)
@@ -219,6 +201,6 @@ class ScaleHyperprior(CompressionModel):
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
         scales_hat = self.h_s(z_hat)
         indexes = self.gaussian_conditional.build_indexes(scales_hat)
-        y_hat = self.gaussian_conditional.decompress(strings[0], indexes)
+        y_hat = self.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}
